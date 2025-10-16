@@ -7,6 +7,7 @@ import tarfile
 import shutil
 import hashlib
 from datetime import datetime
+
 def calculate_md5(file_path, chunk_size=4096):
     """计算文件的 MD5 值"""
     md5_hash = hashlib.md5()
@@ -96,6 +97,8 @@ def main():
     parser = argparse.ArgumentParser(description='处理插件配置文件')
     parser.add_argument('properties_path', nargs='?', default=None,
                         help='properties文件路径（默认：脚本所在目录下的plugins.properties）')
+    parser.add_argument('--download-v2', action='store_true',
+                        help='是否下载 2.0.0 版本插件')
     args = parser.parse_args()
 
     # 用户未提供路径时，使用默认逻辑
@@ -116,27 +119,35 @@ def main():
 
     for plugin_name, plugin_url in properties.items():
         print(f"\n正在处理插件: {plugin_name}")
-        success = process_plugin(base_path, plugin_name, plugin_url)
+        # 处理原始版本（1.0.0）
+        success = process_plugin(base_path, plugin_name, plugin_url, "1.0.0")
         if not success:
-            failed_plugins.append(plugin_name)
+            failed_plugins.append(f"{plugin_name}:1.0.0")
+        
+        # 如果指定了 --download-v2 参数，则额外处理 2.0.0 版本
+        if args.download_v2:
+            v2_url = plugin_url.replace(":1.0.0", ":2.0.0")
+            print(f"\n正在处理插件 {plugin_name} 的 2.0.0 版本")
+            success = process_plugin(base_path, plugin_name, v2_url, "2.0.0")
+            if not success:
+                failed_plugins.append(f"{plugin_name}:2.0.0")
 
     if failed_plugins:
         print("\n以下插件未成功处理:")
         for plugin in failed_plugins:
             print(f"- {plugin}")
 
-def process_plugin(base_path, plugin_name, plugin_url):
+def process_plugin(base_path, plugin_name, plugin_url, version):
     """
     处理单个插件下载和信息获取
     """
-    version = plugin_url.split(':')[-1]
     plugins_base_path = os.path.join(base_path, 'plugins')
     os.makedirs(plugins_base_path, exist_ok=True)
 
     plugin_dir = os.path.join(plugins_base_path, plugin_name, version)
     os.makedirs(plugin_dir, exist_ok=True)
 
-    temp_download_dir = os.path.join(plugins_base_path, f"{plugin_name}_temp")
+    temp_download_dir = os.path.join(plugins_base_path, f"{plugin_name}_{version}_temp")
     os.makedirs(temp_download_dir, exist_ok=True)
 
     wasm_found = False
@@ -169,10 +180,10 @@ def process_plugin(base_path, plugin_name, plugin_url):
                 wasm_found = handle_wasm_layer(wasm_path, plugin_dir)
 
     except subprocess.CalledProcessError as e:
-        print(f"{plugin_name} 命令执行失败: {e}")
+        print(f"{plugin_name} ({version}) 命令执行失败: {e}")
         return False
     except Exception as e:
-        print(f"{plugin_name} 处理过程中发生错误: {e}")
+        print(f"{plugin_name} ({version}) 处理过程中发生错误: {e}")
         return False
     finally:
         shutil.rmtree(temp_download_dir, ignore_errors=True)

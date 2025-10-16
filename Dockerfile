@@ -26,7 +26,7 @@ WORKDIR /workspace
 COPY pull_plugins.py plugins.properties ./
 
 # 执行构建操作
-RUN python3 pull_plugins.py 
+RUN python3 pull_plugins.py --download-v2
 
 # 运行阶段：最终镜像
 FROM $NGINX_IMAGE
