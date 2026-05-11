@@ -61,6 +61,7 @@ jobs:
             type=sha
             type=ref,event=tag
             type=semver,pattern={{version}}
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Login to Docker Registry
