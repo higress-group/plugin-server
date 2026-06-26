@@ -93,60 +93,45 @@ def generate_metadata(plugin_dir, plugin_name):
     except Exception as e:
         print(f"生成元数据失败: {e}")
 
-def main():
-    parser = argparse.ArgumentParser(description='处理插件配置文件')
-    parser.add_argument('properties_path', nargs='?', default=None,
-                        help='properties文件路径（默认：脚本所在目录下的plugins.properties）')
-    parser.add_argument('--download-v2', action='store_true',
-                        help='是否下载 2.0.0 版本插件')
-    args = parser.parse_args()
-
-    # 用户未提供路径时，使用默认逻辑
-    if args.properties_path is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        default_path = os.path.join(script_dir, 'plugins.properties')
-
-        args.properties_path = default_path
-
-    base_path = os.path.dirname(args.properties_path)
-    properties = read_properties(args.properties_path)
-
-    if not properties:
-        print("未找到有效的插件配置")
-        return
-
-    failed_plugins = []
-
-    for plugin_name, plugin_url in properties.items():
-        print(f"\n正在处理插件: {plugin_name}")
-        # 处理原始版本（1.0.0）
-        success = process_plugin(base_path, plugin_name, plugin_url, "1.0.0")
-        if not success:
-            failed_plugins.append(f"{plugin_name}:1.0.0")
-        
-        # 如果指定了 --download-v2 参数，则额外处理 2.0.0 版本
-        if args.download_v2:
-            v2_url = plugin_url.replace(":1.0.0", ":2.0.0")
-            print(f"\n正在处理插件 {plugin_name} 的 2.0.0 版本")
-            success = process_plugin(base_path, plugin_name, v2_url, "2.0.0")
-            if not success:
-                failed_plugins.append(f"{plugin_name}:2.0.0")
-
-    if failed_plugins:
-        print("\n以下插件未成功处理:")
-        for plugin in failed_plugins:
-            print(f"- {plugin}")
-        sys.exit(1)
-
-def process_plugin(base_path, plugin_name, plugin_url, version):
+def generate_all_metadata(base_path):
     """
-    处理单个插件下载和信息获取
+    统一生成 metadata.txt:扫描 plugins/<name>/<version>/plugin.wasm,
+    覆盖 properties 中下载/跳过的插件、本地预置插件,以及未在 properties
+    中定义的自定义插件。临时目录(<name>_<version>_temp)与失败目录
+    因不匹配该路径模板,不会被遍历。
+    """
+    plugins_base_path = os.path.join(base_path, 'plugins')
+    if not os.path.isdir(plugins_base_path):
+        return 0
+    count = 0
+    for plugin_name in sorted(os.listdir(plugins_base_path)):
+        name_dir = os.path.join(plugins_base_path, plugin_name)
+        if not os.path.isdir(name_dir):
+            continue
+        for version in sorted(os.listdir(name_dir)):
+            plugin_dir = os.path.join(name_dir, version)
+            if os.path.isfile(os.path.join(plugin_dir, 'plugin.wasm')):
+                generate_metadata(plugin_dir, plugin_name)
+                count += 1
+    print(f"共为 {count} 个插件目录生成 metadata.txt")
+    return count
+
+def process_plugin(base_path, plugin_name, plugin_url, version, use_local=False):
+    """
+    处理单个 OCI 插件:把 plugin.wasm 放到 plugins/<name>/<version>/。
+    本地已预置(通过 Dockerfile 的 COPY plugins/)则跳过下载。
+    metadata.txt 不在此处生成,由 generate_all_metadata() 统一处理。
     """
     plugins_base_path = os.path.join(base_path, 'plugins')
     os.makedirs(plugins_base_path, exist_ok=True)
 
     plugin_dir = os.path.join(plugins_base_path, plugin_name, version)
     os.makedirs(plugin_dir, exist_ok=True)
+
+    # 只有 use_local=True 时才检查本地已预置的 plugin.wasm:跳过下载
+    if use_local and os.path.isfile(os.path.join(plugin_dir, 'plugin.wasm')):
+        print(f"{plugin_name} ({version}) 检测到本地副本,跳过下载")
+        return True
 
     temp_download_dir = os.path.join(plugins_base_path, f"{plugin_name}_{version}_temp")
     os.makedirs(temp_download_dir, exist_ok=True)
@@ -191,13 +176,59 @@ def process_plugin(base_path, plugin_name, plugin_url, version):
     finally:
         shutil.rmtree(temp_download_dir, ignore_errors=True)
 
-    if wasm_found:
-        generate_metadata(plugin_dir, plugin_name)
-    else:
+    if not wasm_found:
         print(f"{plugin_name} ({version}) 未找到 .wasm 文件")
         shutil.rmtree(plugin_dir, ignore_errors=True)
 
     return wasm_found
+
+def main():
+    parser = argparse.ArgumentParser(description='处理插件配置文件')
+    parser.add_argument('properties_path', nargs='?', default=None,
+                        help='properties文件路径（默认：脚本所在目录下的plugins.properties）')
+    parser.add_argument('--download-v2', action='store_true',
+                        help='是否下载 2.0.0 版本插件')
+    parser.add_argument('--use-local', action='store_true',
+                        help='启用本地 WASM 文件：plugins/<name>/<version>/plugin.wasm 存在时跳过 OCI 下载')
+    args = parser.parse_args()
+
+    # 用户未提供路径时，使用默认逻辑
+    if args.properties_path is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        args.properties_path = os.path.join(script_dir, 'plugins.properties')
+
+    base_path = os.path.dirname(args.properties_path)
+    properties = read_properties(args.properties_path)
+
+    if not properties:
+        print("未找到有效的插件配置")
+        return
+
+    failed_plugins = []
+
+    for plugin_name, plugin_url in properties.items():
+        print(f"\n正在处理插件: {plugin_name}")
+        # 处理原始版本（1.0.0）
+        success = process_plugin(base_path, plugin_name, plugin_url, "1.0.0", use_local=args.use_local)
+        if not success:
+            failed_plugins.append(f"{plugin_name}:1.0.0")
+
+        # 如果指定了 --download-v2 参数，则额外处理 2.0.0 版本
+        if args.download_v2:
+            v2_url = plugin_url.replace(":1.0.0", ":2.0.0")
+            print(f"\n正在处理插件 {plugin_name} 的 2.0.0 版本")
+            success = process_plugin(base_path, plugin_name, v2_url, "2.0.0", use_local=args.use_local)
+            if not success:
+                failed_plugins.append(f"{plugin_name}:2.0.0")
+
+    # 统一生成 metadata.txt:覆盖下载的、本地预置的、以及未在 properties 中定义的自定义插件
+    generate_all_metadata(base_path)
+
+    if failed_plugins:
+        print("\n以下插件未成功处理:")
+        for plugin in failed_plugins:
+            print(f"- {plugin}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
