@@ -37,8 +37,7 @@ FROM builder-base AS local-true
 COPY plugins/ ./plugins/
 
 FROM builder-base AS local-false
-# 不启用本地模式：创建空的 plugins 目录
-RUN mkdir -p plugins
+# 不启用本地模式：plugins/ 目录由 pull_plugins.py 自行创建(os.makedirs)
 
 FROM local-${USE_LOCAL_PLUGINS:-false} AS builder
 
@@ -48,7 +47,8 @@ RUN if [ "$USE_LOCAL_PLUGINS" = "true" ]; then \
         python3 pull_plugins.py --download-v2 --use-local; \
     else \
         python3 pull_plugins.py --download-v2; \
-    fi
+    fi && \
+    rm -f /workspace/plugins/.gitkeep
 
 # 运行阶段：最终镜像
 FROM $NGINX_IMAGE

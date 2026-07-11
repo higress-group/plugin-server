@@ -116,6 +116,13 @@ def generate_all_metadata(base_path):
     print(f"共为 {count} 个插件目录生成 metadata.txt")
     return count
 
+def is_valid_wasm(path):
+    """最小校验:存在、非空、且以 wasm magic (\\x00asm) 开头。"""
+    if not os.path.isfile(path) or os.path.getsize(path) < 8:
+        return False
+    with open(path, 'rb') as f:
+        return f.read(4) == b'\x00asm'
+
 def process_plugin(base_path, plugin_name, plugin_url, version, use_local=False):
     """
     处理单个 OCI 插件:把 plugin.wasm 放到 plugins/<name>/<version>/。
@@ -128,10 +135,14 @@ def process_plugin(base_path, plugin_name, plugin_url, version, use_local=False)
     plugin_dir = os.path.join(plugins_base_path, plugin_name, version)
     os.makedirs(plugin_dir, exist_ok=True)
 
-    # 只有 use_local=True 时才检查本地已预置的 plugin.wasm:跳过下载
-    if use_local and os.path.isfile(os.path.join(plugin_dir, 'plugin.wasm')):
-        print(f"{plugin_name} ({version}) 检测到本地副本,跳过下载")
-        return True
+    # use_local=True 时校验本地副本:合法(非空且 wasm magic 正确)才跳过下载
+    local_wasm = os.path.join(plugin_dir, 'plugin.wasm')
+    if use_local:
+        if is_valid_wasm(local_wasm):
+            print(f"{plugin_name} ({version}) 检测到本地副本,跳过下载")
+            return True
+        if os.path.isfile(local_wasm):
+            print(f"{plugin_name} ({version}) 本地副本存在但校验失败,将重新下载")
 
     temp_download_dir = os.path.join(plugins_base_path, f"{plugin_name}_{version}_temp")
     os.makedirs(temp_download_dir, exist_ok=True)
@@ -201,7 +212,9 @@ def main():
     properties = read_properties(args.properties_path)
 
     if not properties:
-        print("未找到有效的插件配置")
+        # 空配置(如纯本地插件场景):仍为本地预置的插件生成 metadata,然后结束
+        print("未找到有效的插件配置,仅处理本地预置插件(若存在)")
+        generate_all_metadata(base_path)
         return
 
     failed_plugins = []
