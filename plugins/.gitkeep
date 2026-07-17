@@ -1,0 +1,4 @@
+# 此占位文件确保 plugins/ 目录被 git 跟踪,从而使 Dockerfile 的
+# "COPY plugins/ ./plugins/" 在全新克隆后仍有源目录可用。
+# 本地/自定义插件以 plugins/<插件名>/<版本>/plugin.wasm 形式放入此目录;
+# 下载产物与 metadata.txt 由构建生成,不纳入版本控制(见 .gitignore)。

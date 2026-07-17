@@ -133,6 +133,52 @@ MCP_SERVER_WASM_IMAGE_URL=http://higress-plugin-server.higress-system.svc/plugin
 
 > `higress-plugin-server.higress-system.svc` 替换为 Higress Gateway 可以用来访问插件服务器的地址。
 
+## 使用本地 WASM 文件
+
+不想把 WASM 推送到 OCI 仓库时（自定义插件，或用自编译版本覆盖官方插件），可直接把 `plugin.wasm` 放进仓库的 `plugins/` 目录。
+
+> ⚠️ **默认行为**：`USE_LOCAL_PLUGINS` 默认为 `false`，构建时按 `plugins.properties` 从 OCI 仓库下载所有插件，`plugins/` 目录被忽略。
+> 要启用本地 WASM 覆盖，需在构建时指定 `--build-arg USE_LOCAL_PLUGINS=true`。
+
+启用本地模式后，`plugins/<插件名>/<版本>/plugin.wasm` 会随构建上下文带入；与本地同名同版本的 OCI 下载会被自动跳过，构建结束时为 `plugins/<插件名>/<版本>/` 下的 `plugin.wasm` 自动生成 `metadata.txt`。**无需修改 `plugins.properties`**——本地插件按目录约定自动识别。
+
+### 启用本地 WASM 构建
+
+```bash
+docker build --build-arg USE_LOCAL_PLUGINS=true -t higress-plugin-server:1.0.0 -f Dockerfile .
+```
+
+也可与国内镜像加速参数组合使用：
+
+```bash
+docker build \
+  --build-arg ALPINE_MIRROR=mirrors.aliyun.com \
+  --build-arg USE_LOCAL_PLUGINS=true \
+  -t higress-plugin-server:1.0.0 \
+  -f Dockerfile .
+```
+
+### 两种用法
+
+1. **新增自定义插件**：在 `plugins/<插件名>/<版本>/` 下放置 `plugin.wasm`，不要写进 `plugins.properties`。它不会被下载，构建后自动生成 `metadata.txt` 并被 serve。需要哪些版本就放哪些版本目录。
+
+2. **覆盖官方插件**：保留 `plugins.properties` 中该插件的 OCI 配置，同时把你的 `plugin.wasm` 放到同名同版本目录下。启用本地模式后脚本检测到本地副本会跳过下载。`Dockerfile` 构建时同时处理 `1.0.0` 和 `2.0.0` 两个版本，所以要覆盖哪个版本就把文件放进对应版本目录。
+
+### 目录结构
+
+按 `plugins/<插件名>/<版本>/plugin.wasm` 放置；`metadata.txt` 无需手动提供，构建时按实际文件自动（重）生成：
+
+```
+.                              ← 仓库根目录（构建上下文）
+├── plugins.properties
+└── plugins/
+    └── my-plugin/
+        ├── 1.0.0/
+        │   └── plugin.wasm
+        └── 2.0.0/
+            └── plugin.wasm
+```
+
 ## 参考文档
 
 - 如何修改内置插件镜像地址：https://higress.cn/docs/latest/ops/how-tos/builtin-plugin-url/

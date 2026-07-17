@@ -2,8 +2,9 @@
 ARG PYTHON_IMAGE=higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/python:3.11-alpine
 ARG NGINX_IMAGE=higress-registry.cn-hangzhou.cr.aliyuncs.com/higress/nginx:alpine
 ARG ALPINE_MIRROR=""
+ARG USE_LOCAL_PLUGINS=false
 
-FROM $PYTHON_IMAGE AS builder
+FROM $PYTHON_IMAGE AS builder-base
 
 # 配置 Alpine 镜像源（可选，本地构建时可指定国内镜像加速）
 ARG ALPINE_MIRROR
@@ -26,14 +27,28 @@ RUN set -eux; \
     && rm -rf /tmp/oras.tar.gz oras \
     && oras version
 
-# 创建工作目录
 WORKDIR /workspace
 
-# 复制脚本
+# 复制脚本和公共文件
 COPY pull_plugins.py plugins.properties ./
 
-# 执行构建操作
-RUN python3 pull_plugins.py --download-v2
+FROM builder-base AS local-true
+# 启用本地模式：复制本地插件源
+COPY plugins/ ./plugins/
+
+FROM builder-base AS local-false
+# 不启用本地模式：plugins/ 目录由 pull_plugins.py 自行创建(os.makedirs)
+
+FROM local-${USE_LOCAL_PLUGINS:-false} AS builder
+
+# 根据 USE_LOCAL_PLUGINS 决定是否启用本地 WASM 文件覆盖
+ARG USE_LOCAL_PLUGINS
+RUN if [ "$USE_LOCAL_PLUGINS" = "true" ]; then \
+        python3 pull_plugins.py --download-v2 --use-local; \
+    else \
+        python3 pull_plugins.py --download-v2; \
+    fi && \
+    rm -f /workspace/plugins/.gitkeep
 
 # 运行阶段：最终镜像
 FROM $NGINX_IMAGE
