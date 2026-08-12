@@ -1,91 +1,32 @@
-name: Build Plugin Server Image and Push
+name: Validate Development Plugin Server Build
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version tag (optional, without leading v)"
-        required: false
+      snapshot_path:
+        description: "Development snapshot fixture path"
+        required: true
         type: string
 
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-server-development-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build-plugin-server-image:
+  validate-development-build:
     runs-on: ubuntu-latest
-    environment:
-      name: image-registry-plugin-server
-    env:
-      IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY || 'higress-registry.cn-hangzhou.cr.aliyuncs.com' }}
-      IMAGE_NAME: ${{ vars.PLUGIN_SERVER_IMAGE_NAME || 'higress/plugin-server' }}
     steps:
       - name: "Checkout ${{ github.ref }}"
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Free Up GitHub Actions Ubuntu Runner Disk Space 🔧
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          image: tonistiigi/binfmt:qemu-v7.0.0
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
-
-      - name: Calculate Docker metadata
-        id: docker-meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') || startsWith(github.ref, 'refs/tags/') }}
-
-      - name: Login to Docker Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.IMAGE_REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
-
-      - name: Build Docker Image and Push
+      - name: Reject production publication
         run: |
-          BUILT_IMAGE=""
-          readarray -t IMAGES <<< "${{ steps.docker-meta.outputs.tags }}"
-          for image in "${IMAGES[@]}"; do
-            echo "Image: $image"
-            if [ "$BUILT_IMAGE" == "" ]; then
-              docker buildx build \
-                  --platform linux/amd64,linux/arm64 \
-                  -t "$image" \
-                  -f Dockerfile \
-                  --push \
-                  .
-              BUILT_IMAGE="$image"
-            else
-              docker buildx imagetools create "$BUILT_IMAGE" --tag "$image"
-            fi
-          done
+          set -euo pipefail
+          test -f "${{ inputs.snapshot_path }}"
+          python3 pull_plugins.py --snapshot "${{ inputs.snapshot_path }}" --output /tmp/plugins
+          echo "This repository may publish only to a separately configured development/candidate namespace."

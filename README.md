@@ -1,5 +1,21 @@
 # Higress Plugin Server
 
+## Immutable snapshot builds
+
+Production gateway-version images are assembled only by the protected Higress
+workflow from a canonical Higress snapshot, an exact plugin-server source
+commit, and digest-addressed OCI artifacts. Invoke `pull_plugins.py --snapshot
+snapshot.json --output plugins` for a local fixture. The downloader rejects a
+missing/ambiguous plugin-server mapping, OCI tag/version drift, digest mismatch,
+unsafe tar layout, missing Wasm content, and invalid Wasm magic. It writes
+logical aliases (including `json-converter` / `jsonrpc-converter`) from the
+same verified bytes and records their content hashes in `snapshot-inventory.json`.
+
+The repository-local workflow is validation-only and has no production registry
+credential. The external release cutover must grant the Higress pinned-snapshot
+workflow the sole production writer for `higress/plugin-server:<gateway-version>`;
+this repository may use a separate development/candidate namespace only.
+
 HTTP server for Higress Wasm plugins
 
 ## 构建插件服务器镜像并推送
