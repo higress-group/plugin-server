@@ -3,6 +3,7 @@ import importlib.util
 import json
 import pathlib
 import copy
+import subprocess
 import tempfile
 import unittest
 
@@ -190,7 +191,7 @@ class UnmanagedHistoryTest(unittest.TestCase):
         self.assertEqual({call[:2] for call in unmanaged_calls}, expected_calls)
 
     def test_invalid_history_fails_before_any_download(self):
-        for case in ("duplicate", "latest", "traversal", "tag-drift", "bad-hash", "unknown-field"):
+        for case in ("duplicate", "latest", "traversal", "tag-drift", "bad-hash", "unknown-field", "tag-129", "tag-256", "tag-leading-dash", "tag-non-ascii"):
             with self.subTest(case=case):
                 broken = copy.deepcopy(self.lock)
                 old = broken["basic-auth"]["history"][0]
@@ -202,6 +203,13 @@ class UnmanagedHistoryTest(unittest.TestCase):
                     old.update({"servedVersion": "../escape", "tag": "../escape"})
                 elif case == "tag-drift":
                     old["tag"] = "2.0.2"
+                elif case in ("tag-129", "tag-256"):
+                    length = int(case.split("-")[1])
+                    old.update({"servedVersion": "a" * length, "tag": "a" * length})
+                elif case == "tag-leading-dash":
+                    old.update({"servedVersion": "-invalid", "tag": "-invalid"})
+                elif case == "tag-non-ascii":
+                    old.update({"servedVersion": "2.0.0-é", "tag": "2.0.0-é"})
                 elif case == "bad-hash":
                     old["wasmSha256"] = "not-a-hash"
                 else:
@@ -210,6 +218,7 @@ class UnmanagedHistoryTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.materialize()
                 self.assertEqual(self.calls, [])
+                print("S01 invalid history %s: copy_calls=0" % case)
 
     def test_managed_unmanaged_path_collision_fails_before_any_download(self):
         self.managed_entry["version"] = "2.0.1"
@@ -219,6 +228,47 @@ class UnmanagedHistoryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "collide"):
             self.materialize()
         self.assertEqual(self.calls, [])
+
+    def test_invalid_current_tag_fails_before_any_download(self):
+        invalid = "a" * 256
+        broken = copy.deepcopy(self.lock)
+        broken["basic-auth"].update({"servedVersion": invalid, "tag": invalid})
+        self.lock_path.write_text(json.dumps({"schemaVersion": 1, "plugins": broken}))
+        properties = self.properties.read_text().replace("basic-auth=oci://registry.example/plugins/basic-auth:2.0.1", "basic-auth=oci://registry.example/plugins/basic-auth:" + invalid)
+        self.properties.write_text(properties)
+        with self.assertRaisesRegex(ValueError, "repository:tag"):
+            self.materialize()
+        self.assertEqual(self.calls, [])
+        print("S01 invalid current tag-256: copy_calls=0")
+
+    def test_s01_before_after_256_character_history_tag(self):
+        baseline = "8a550170345752d92b715f239f642083d8e9a772"
+        legacy_source = subprocess.check_output(["git", "show", baseline + ":pull_plugins.py"], cwd=MODULE_PATH.parent)
+        legacy_path = self.root / "legacy_pull_plugins.py"
+        legacy_path.write_bytes(legacy_source)
+        legacy_spec = importlib.util.spec_from_file_location("legacy_pull_plugins", legacy_path)
+        legacy = importlib.util.module_from_spec(legacy_spec)
+        legacy_spec.loader.exec_module(legacy)
+        broken = copy.deepcopy(self.lock)
+        old = broken["basic-auth"]["history"][0]
+        old.update({"servedVersion": "a" * 256, "tag": "a" * 256})
+        self.lock_path.write_text(json.dumps({"schemaVersion": 1, "plugins": broken}))
+        legacy.copy_oci_wasm = pull_plugins.copy_oci_wasm
+        with self.assertRaises(OSError):
+            legacy.materialize_snapshot(str(self.snapshot), str(self.output), str(self.properties), str(self.lock_path))
+        self.assertGreater(len(self.calls), 0)
+        print("S01 RED old history tag-256: copy_calls=%d" % len(self.calls))
+        self.calls.clear()
+        with self.assertRaises(ValueError):
+            self.materialize()
+        self.assertEqual(self.calls, [])
+        print("S01 GREEN new history tag-256: copy_calls=0")
+
+    def test_oci_tag_ascii_boundaries(self):
+        self.assertTrue(pull_plugins.valid_oci_tag("a" * 128))
+        self.assertTrue(pull_plugins.valid_oci_tag("_valid.Tag-1"))
+        for invalid in ("", "a" * 129, ".invalid", "-invalid", "é", "tag/escape"):
+            self.assertFalse(pull_plugins.valid_oci_tag(invalid))
 
     def test_checked_in_cpp_200_identities_remain_available_for_history(self):
         expected = {

@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ TAR_MEDIA_TYPES = {
     "application/vnd.oci.image.layer.v1.tar+gzip",
 }
 DIGEST_PREFIX = "sha256:"
+OCI_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 
 
 def sha256_file(path):
@@ -63,9 +65,13 @@ def read_unmanaged_lock(path):
 
 def parse_tag_reference(reference):
     repository, separator, tag = reference.rpartition(":")
-    if not separator or "/" not in repository or not tag or "@" in reference:
+    if not separator or "/" not in repository or not valid_oci_tag(tag) or "@" in reference:
         raise ValueError("properties reference must be a repository:tag")
     return repository, tag
+
+
+def valid_oci_tag(value):
+    return isinstance(value, str) and OCI_TAG_PATTERN.fullmatch(value) is not None
 
 
 def validate_unmanaged_lock(properties, managed, lock):
