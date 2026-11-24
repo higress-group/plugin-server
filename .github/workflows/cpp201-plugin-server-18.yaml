@@ -1,0 +1,191 @@
+name: CPP 2.0.1 plugin-server 18-path acceptance
+
+on:
+  push:
+    branches:
+      - test/cpp201-plugin-server-18
+    paths:
+      - .github/workflows/cpp201-plugin-server-18.yaml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpp201-plugin-server-18-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  accept:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      HIGRESS_CANDIDATE_HEAD: 1a9a7c12c64aee850cb423d7c58c65e631267029
+      HIGRESS_BASE_SNAPSHOT: plugins/release/snapshots/2.2.6.json
+      PLUGIN_SERVER_COMMIT: 0585c6489976c743b912d955ae03905d12739b85
+    steps:
+      - name: Check out plugin-server source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.PLUGIN_SERVER_COMMIT }}
+          path: plugin-server
+          persist-credentials: false
+
+      - name: Check out candidate evidence and standard snapshot
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.HIGRESS_CANDIDATE_HEAD }}
+          path: higress
+          persist-credentials: false
+
+      - name: Install ORAS
+        run: |
+          set -euo pipefail
+          ORAS_VERSION=1.2.3
+          curl -fsSL -o /tmp/oras.tar.gz "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          tar -xzf /tmp/oras.tar.gz -C /usr/local/bin oras
+          oras version
+
+      - name: Materialize candidate 2.0.1 history and prepare build context
+        env:
+          HIGRESS_DIR: ${{ github.workspace }}/higress
+          PS_DIR: ${{ github.workspace }}/plugin-server
+          OUT_DIR: /tmp/cpp201-18
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT_DIR"
+          cp "$HIGRESS_DIR/$HIGRESS_BASE_SNAPSHOT" "$PS_DIR/snapshot.json"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          ps = Path(os.environ["PS_DIR"])
+          higress = Path(os.environ["HIGRESS_DIR"])
+          out = Path(os.environ["OUT_DIR"])
+          evidence = json.loads((higress / "plugins/release/evidence/cpp-hotfix-2.0.1.json").read_text())
+          lock_path = ps / "unmanaged-plugins.lock.json"
+          lock = json.loads(lock_path.read_text())
+          if len(evidence["plugins"]) != 9 or set(lock["plugins"]) != {p["logicalId"] for p in evidence["plugins"]}:
+              raise SystemExit("candidate and unmanaged inventory differ")
+          checks = {}
+          for item in evidence["plugins"]:
+              ref = item["candidateRef"]
+              repo_ref, digest = ref.rsplit("@", 1)
+              repo = repo_ref.rsplit(":", 1)[0]
+              manifest = json.loads(subprocess.check_output(["oras", "manifest", "fetch", f"{repo}@{digest}"]))
+              layers = [l for l in manifest.get("layers", []) if l.get("mediaType") == "application/vnd.module.wasm.content.layer.v1+wasm"]
+              if len(layers) != 1:
+                  raise SystemExit(f"{item['logicalId']}: expected one wasm layer")
+              layer = layers[0]
+              blob = out / f"{item['logicalId']}-2.0.1.wasm"
+              subprocess.check_call(["oras", "blob", "fetch", f"{repo}@{layer['digest']}", "-o", str(blob)])
+              data = blob.read_bytes()
+              actual = hashlib.sha256(data).hexdigest()
+              if "sha256:" + actual != layer["digest"]:
+                  raise SystemExit(f"{item['logicalId']}: candidate layer digest mismatch")
+              if manifest.get("annotations", {}).get("io.higress.plugin.input-hash") != item["inputHash"]:
+                  raise SystemExit(f"{item['logicalId']}: input hash annotation mismatch")
+              entry = lock["plugins"][item["logicalId"]]
+              entry["history"] = [{
+                  "servedVersion": "2.0.1",
+                  "repository": repo,
+                  "tag": "2.0.1",
+                  "digest": digest,
+                  "wasmSha256": actual,
+              }]
+              checks[item["logicalId"]] = {"digest": digest, "wasmSha256": actual, "wasmSize": len(data)}
+          lock_path.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
+          (out / "candidate-checks.json").write_text(json.dumps(checks, indent=2, sort_keys=True) + "\n")
+          print(f"prepared {len(checks)} candidate histories")
+          PY
+
+      - name: Build non-production plugin-server image
+        env:
+          PS_DIR: ${{ github.workspace }}/plugin-server
+          OUT_DIR: /tmp/cpp201-18
+        run: |
+          set -euo pipefail
+          SNAP_SHA=$(sha256sum "$PS_DIR/snapshot.json" | awk '{print $1}')
+          printf '%s\n' "$SNAP_SHA" | tee "$OUT_DIR/base-snapshot-sha256.txt"
+          docker build --pull -t higress-plugin-server:cpp201-18 \
+            --build-arg SNAPSHOT_SHA256="$SNAP_SHA" \
+            --build-arg HIGRESS_SOURCE_COMMIT="$HIGRESS_CANDIDATE_HEAD" \
+            --build-arg PLUGIN_SERVER_SOURCE_COMMIT="$PLUGIN_SERVER_COMMIT" \
+            --build-arg GATEWAY_VERSION="cpp201-nonprod" \
+            "$PS_DIR"
+
+      - name: Run old/new 18 HTTP paths
+        env:
+          PS_DIR: ${{ github.workspace }}/plugin-server
+          OUT_DIR: /tmp/cpp201-18
+        run: |
+          set -euo pipefail
+          image=higress-plugin-server:cpp201-18
+          container=$(docker run -d --rm --name cpp201-ps18 -p 127.0.0.1:18080:8080 "$image")
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          inventory=""
+          for i in $(seq 1 90); do
+            inventory=$(curl -sS -o /tmp/cpp201-18/inventory.json -w '%{http_code}' http://127.0.0.1:18080/plugins/snapshot-inventory.json || true)
+            [ "$inventory" = 200 ] && break
+            sleep 2
+          done
+          test "$inventory" = 200
+          jq -e 'has("mcp-server") and has("json-converter") and has("jsonrpc-converter")' /tmp/cpp201-18/inventory.json >/dev/null
+          : > "$OUT_DIR/rows.tsv"
+          while IFS=$'\t' read -r name new_sha; do
+            old_sha=$(jq -r --arg n "$name" '.plugins[$n].wasmSha256' "$PS_DIR/unmanaged-plugins.lock.json")
+            for version in 2.0.0 2.0.1; do
+              url="http://127.0.0.1:18080/plugins/$name/$version/plugin.wasm"
+              target="$OUT_DIR/$name-$version.wasm"
+              code=$(curl -sS -o "$target" -w '%{http_code}' "$url" || true)
+              test "$code" = 200
+              test "$(head -c 4 "$target" | od -An -tx1 | tr -d ' \n')" = "0061736d"
+              actual=$(sha256sum "$target" | awk '{print $1}')
+              expected=$old_sha
+              if [ "$version" = 2.0.1 ]; then expected=$new_sha; fi
+              test "$actual" = "$expected"
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$version" "$code" "$url" "$actual" "$(wc -c < "$target")" "$expected" >> "$OUT_DIR/rows.tsv"
+            done
+          done < <(jq -r 'to_entries[] | [.key,.value.wasmSha256] | @tsv' "$OUT_DIR/candidate-checks.json")
+          test "$(wc -l < "$OUT_DIR/rows.tsv")" = 18
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          out = Path('/tmp/cpp201-18')
+          rows = []
+          for line in (out / 'rows.tsv').read_text().splitlines():
+              name, version, code, url, sha, size, expected = line.split('\t')
+              rows.append({"name": name, "version": version, "httpStatus": int(code), "url": url, "wasmSha256": sha, "wasmSize": int(size), "expectedSha256": expected})
+          old = [r for r in rows if r["version"] == "2.0.0"]
+          new = [r for r in rows if r["version"] == "2.0.1"]
+          result = {
+              "schemaVersion": 1,
+              "sourceCandidateHead": "1a9a7c12c64aee850cb423d7c58c65e631267029",
+              "pluginServerCommit": "0585c6489976c743b912d955ae03905d12739b85",
+              "baseSnapshot": "plugins/release/snapshots/2.2.6.json",
+              "baseSnapshotSha256": (out / 'base-snapshot-sha256.txt').read_text().strip(),
+              "imageId": __import__('subprocess').check_output(['docker', 'image', 'inspect', '--format', '{{.Id}}', 'higress-plugin-server:cpp201-18']).decode().strip(),
+              "paths": rows,
+              "checks": {
+                  "18Http200": len(rows) == 18 and all(r["httpStatus"] == 200 for r in rows),
+                  "oldAndNewVersions": sorted({r["version"] for r in rows}) == ["2.0.0", "2.0.1"],
+                  "allWasmMagic": all(r["wasmSize"] > 8 for r in rows),
+                  "oldMatchesPrelockedBytes": len(old) == 9 and all(r["wasmSha256"] == r["expectedSha256"] for r in old),
+                  "newMatchesCandidateBytes": len(new) == 9 and all(r["wasmSha256"] == r["expectedSha256"] for r in new),
+                  "oldAndNewDiffer": all(next(x["wasmSha256"] for x in old if x["name"] == r["name"]) != r["wasmSha256"] for r in new),
+              },
+          }
+          (out / 'evidence.json').write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+          print(json.dumps(result['checks'], sort_keys=True))
+          PY
+
+      - name: Upload 18-path evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cpp201-plugin-server-18-${{ github.sha }}
+          path: /tmp/cpp201-18
+          if-no-files-found: error
+          retention-days: 14
