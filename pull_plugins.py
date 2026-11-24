@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ TAR_MEDIA_TYPES = {
     "application/vnd.oci.image.layer.v1.tar+gzip",
 }
 DIGEST_PREFIX = "sha256:"
+OCI_TAG_PATTERN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 
 
 def sha256_file(path):
@@ -63,9 +65,13 @@ def read_unmanaged_lock(path):
 
 def parse_tag_reference(reference):
     repository, separator, tag = reference.rpartition(":")
-    if not separator or "/" not in repository or not tag or "@" in reference:
+    if not separator or "/" not in repository or not valid_oci_tag(tag) or "@" in reference:
         raise ValueError("properties reference must be a repository:tag")
     return repository, tag
+
+
+def valid_oci_tag(value):
+    return isinstance(value, str) and OCI_TAG_PATTERN.fullmatch(value) is not None
 
 
 def validate_unmanaged_lock(properties, managed, lock):
@@ -74,18 +80,52 @@ def validate_unmanaged_lock(properties, managed, lock):
         missing = sorted(unmanaged - set(lock))
         extra = sorted(set(lock) - unmanaged)
         raise ValueError("unmanaged lock inventory mismatch: missing=%s extra=%s" % (missing, extra))
+    reserved_paths = set()
     for name in sorted(unmanaged):
         item = lock[name]
         repository, tag = parse_tag_reference(properties[name])
         required = ("logicalKey", "servedPath", "servedVersion", "repository", "tag", "digest", "wasmSha256")
-        if any(not item.get(field) for field in required):
+        if not isinstance(item, dict) or any(not item.get(field) for field in required):
             raise ValueError("unmanaged lock for %s is incomplete" % name)
+        if set(item) - set(required) - {"history"}:
+            raise ValueError("unmanaged lock for %s has unsupported fields" % name)
         if item["logicalKey"] != name or item["servedPath"] != name or item["servedVersion"] != tag:
             raise ValueError("unmanaged lock for %s changes its served identity" % name)
         if item["repository"] != repository or item["tag"] != tag:
             raise ValueError("unmanaged lock for %s drifts from properties" % name)
+        if tag == "latest" or not safe_path_component(name) or not safe_path_component(tag):
+            raise ValueError("unmanaged lock for %s has an unsafe or mutable served path" % name)
         if not valid_digest(item["digest"]) or not valid_hash(item["wasmSha256"]):
             raise ValueError("unmanaged lock for %s has invalid immutable hashes" % name)
+        reserve_unmanaged_path(reserved_paths, item["servedPath"], item["servedVersion"], name)
+        history = item.get("history", [])
+        if not isinstance(history, list):
+            raise ValueError("unmanaged lock history for %s must be a list" % name)
+        for old in history:
+            required_history = ("servedVersion", "repository", "tag", "digest", "wasmSha256")
+            if not isinstance(old, dict) or set(old) != set(required_history) or any(not old.get(field) for field in required_history):
+                raise ValueError("unmanaged lock history for %s has an invalid schema" % name)
+            if old["tag"] != old["servedVersion"] or old["tag"] == "latest":
+                raise ValueError("unmanaged lock history for %s has tag/version drift" % name)
+            parse_tag_reference(old["repository"] + ":" + old["tag"])
+            if not safe_path_component(old["servedVersion"]):
+                raise ValueError("unmanaged lock history for %s has an unsafe version" % name)
+            if not valid_digest(old["digest"]) or not valid_hash(old["wasmSha256"]):
+                raise ValueError("unmanaged lock history for %s has invalid immutable hashes" % name)
+            reserve_unmanaged_path(reserved_paths, item["servedPath"], old["servedVersion"], name)
+
+
+def safe_path_component(value):
+    return isinstance(value, str) and value not in ("", ".", "..") and "/" not in value and "\\" not in value and "\x00" not in value
+
+
+def reserve_unmanaged_path(reserved_paths, served_path, version, name):
+    if not safe_path_component(served_path) or not safe_path_component(version):
+        raise ValueError("unmanaged lock for %s has an unsafe output path" % name)
+    path = (served_path, version)
+    if path in reserved_paths:
+        raise ValueError("unmanaged lock for %s has a current/history path collision" % name)
+    reserved_paths.add(path)
 
 
 def valid_digest(value):
@@ -153,6 +193,7 @@ def snapshot_entries(snapshot):
     if snapshot.get("schemaVersion") != 1:
         raise ValueError("unsupported snapshot schema")
     seen = set()
+    paths = set()
     for entry in snapshot.get("plugins", []):
         mapping = entry.get("consumers", {}).get("pluginServer")
         if not mapping:
@@ -162,19 +203,49 @@ def snapshot_entries(snapshot):
             raise ValueError("snapshot plugin lacks immutable identity")
         key = mapping.get("inventoryKey")
         path = mapping.get("httpPath")
-        if not key or not path or key in seen:
+        aliases = mapping.get("aliases", [])
+        if not isinstance(aliases, list) or not key or not path or key in seen:
             raise ValueError("snapshot plugin-server mapping is missing or ambiguous")
-        seen.add(key)
-        if "/" not in entry["ociRef"] or not entry["ociRef"].endswith(":" + entry["version"]):
+        names = [key] + aliases
+        if any(not safe_path_component(name) or name in seen for name in names) or not safe_path_component(path) or not safe_path_component(entry["version"]):
+            raise ValueError("snapshot plugin-server mapping has an unsafe or duplicate path")
+        seen.update(names)
+        repository, tag = parse_tag_reference(entry["ociRef"])
+        if not repository or tag != entry["version"] or tag == "latest" or not valid_digest(entry["digest"]):
             raise ValueError("snapshot OCI tag and version disagree")
+        for served_path in set(names + [path]):
+            claim = (served_path, entry["version"])
+            if claim in paths:
+                raise ValueError("snapshot plugin-server paths are ambiguous")
+            paths.add(claim)
         yield entry, mapping
 
 
 def materialize_snapshot(snapshot_path, output, properties_path, lock_path):
     with open(snapshot_path, encoding="utf-8") as source:
         snapshot = json.load(source)
+    entries = list(snapshot_entries(snapshot))
+    if not entries:
+        raise ValueError("snapshot has no plugin-server managed entries")
+    properties = read_properties(properties_path)
+    lock = read_unmanaged_lock(lock_path)
+    managed = set()
+    managed_paths = set()
+    for entry, mapping in entries:
+        aliases = [mapping["inventoryKey"]] + mapping.get("aliases", [])
+        managed.update(aliases)
+        managed_paths.add((mapping["httpPath"], entry["version"]))
+        managed_paths.update((alias, entry["version"]) for alias in aliases)
+    validate_unmanaged_lock(properties, managed, lock)
+    for name in sorted(lock):
+        item = lock[name]
+        claims = {(item["servedPath"], item["servedVersion"])}
+        claims.update((item["servedPath"], old["servedVersion"]) for old in item.get("history", []))
+        if managed_paths & claims:
+            raise ValueError("managed and unmanaged plugin paths collide")
+
     written = {}
-    for entry, mapping in snapshot_entries(snapshot):
+    for entry, mapping in entries:
         target = os.path.join(output, mapping["httpPath"], entry["version"], "plugin.wasm")
         content_hash = copy_oci_wasm(entry["ociRef"].rsplit(":", 1)[0], entry["digest"], target)
         for alias in [mapping["inventoryKey"]] + mapping.get("aliases", []):
@@ -183,23 +254,20 @@ def materialize_snapshot(snapshot_path, output, properties_path, lock_path):
                 os.makedirs(os.path.dirname(alias_target), exist_ok=True)
                 shutil.copyfile(target, alias_target)
             written[alias] = {"version": entry["version"], "digest": entry["digest"], "wasmSha256": content_hash}
-    if not written:
-        raise ValueError("snapshot has no plugin-server managed entries")
     with open(os.path.join(output, "snapshot-inventory.json"), "w", encoding="utf-8") as target:
         json.dump(dict(sorted(written.items())), target, indent=2, sort_keys=True)
         target.write("\n")
     # Preserve source-owned unmanaged C++/compatibility entries. Properties
     # retain their public served identity; only the sibling lock supplies the
     # immutable pull reference. Snapshot-managed keys are never duplicated.
-    properties = read_properties(properties_path)
-    lock = read_unmanaged_lock(lock_path)
-    validate_unmanaged_lock(properties, set(written), lock)
     for name in sorted(lock):
         item = lock[name]
-        target = os.path.join(output, item["servedPath"], item["servedVersion"], "plugin.wasm")
-        content_hash = copy_oci_wasm(item["repository"], item["digest"], target)
-        if content_hash != item["wasmSha256"]:
-            raise ValueError("unmanaged plugin %s Wasm hash does not match source-owned lock" % name)
+        artifacts = [(item, name)] + [(old, name + " history " + old["servedVersion"]) for old in item.get("history", [])]
+        for artifact, label in artifacts:
+            target = os.path.join(output, item["servedPath"], artifact["servedVersion"], "plugin.wasm")
+            content_hash = copy_oci_wasm(artifact["repository"], artifact["digest"], target)
+            if content_hash != artifact["wasmSha256"]:
+                raise ValueError("unmanaged plugin %s Wasm hash does not match source-owned lock" % label)
 
 
 def materialize_legacy(properties_path, output):
