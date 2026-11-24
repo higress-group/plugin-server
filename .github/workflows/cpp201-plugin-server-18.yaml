@@ -68,10 +68,17 @@ jobs:
           evidence = json.loads((higress / "plugins/release/evidence/cpp-hotfix-2.0.1.json").read_text())
           lock_path = ps / "unmanaged-plugins.lock.json"
           lock = json.loads(lock_path.read_text())
-          if len(evidence["plugins"]) != 9 or set(lock["plugins"]) != {p["logicalId"] for p in evidence["plugins"]}:
+          plugins = evidence["plugins"]
+          if isinstance(plugins, dict):
+              items = [dict(value, logicalId=name) for name, value in sorted(plugins.items())]
+          elif isinstance(plugins, list):
+              items = plugins
+          else:
+              raise SystemExit("evidence plugins must be an object or list")
+          if len(items) != 9 or set(lock["plugins"]) != {p["logicalId"] for p in items}:
               raise SystemExit("candidate and unmanaged inventory differ")
           checks = {}
-          for item in evidence["plugins"]:
+          for item in items:
               ref = item["candidateRef"]
               repo_ref, digest = ref.rsplit("@", 1)
               repo = repo_ref.rsplit(":", 1)[0]
