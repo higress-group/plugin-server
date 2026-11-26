@@ -538,6 +538,69 @@ class UnmanagedHistoryTest(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), artifact["wasmSha256"])
         self.assertEqual({call[:2] for call in unmanaged_calls}, expected_calls)
 
+    def test_migrated_ownership_materializes_nine_managed_current_and_history_entries(self):
+        plugins = [self.managed_entry]
+        for name in HOTFIX_IDS:
+            current = self.lock.pop(name)
+            previous = current["history"][0]
+            managed = entry(name, aliases=[name + "-compat"])
+            managed.update({
+                "image": "plugins/" + name,
+                "version": current["servedVersion"],
+                "ociRef": current["repository"] + ":" + current["tag"],
+                "digest": current["digest"],
+                "wasmSha256": current["wasmSha256"],
+                "history": [{
+                    "version": previous["servedVersion"],
+                    "ociRef": previous["repository"] + ":" + previous["tag"],
+                    "digest": previous["digest"],
+                    "wasmSha256": previous["wasmSha256"],
+                    "provenanceMode": "public",
+                }],
+            })
+            plugins.append(managed)
+        retained = lock_item("retained-unmanaged")
+        self.lock["retained-unmanaged"] = retained
+        self.payloads[(retained["repository"], retained["digest"])] = WASM
+        self.write_lock()
+        self.snapshot.write_text(json.dumps({"schemaVersion": 1, "plugins": plugins}))
+        self.properties.write_text(self.properties.read_text() + "retained-unmanaged=oci://" + retained["repository"] + ":" + retained["tag"] + "\n")
+        properties = pull_plugins.read_properties(str(self.properties))
+        managed_keys = set()
+        for plugin in plugins:
+            mapping = plugin["consumers"]["pluginServer"]
+            managed_keys.update([mapping["inventoryKey"]] + mapping.get("aliases", []))
+        self.assertTrue(set(HOTFIX_IDS).isdisjoint(self.lock))
+        self.assertTrue(set(HOTFIX_IDS).issubset(managed_keys))
+        self.assertEqual(set(properties) - managed_keys, {"retained-unmanaged"})
+        self.assertEqual(set(self.lock), set(properties) - managed_keys)
+        pull_plugins.validate_unmanaged_lock(properties, managed_keys, self.lock)
+
+        self.materialize()
+        expected_inventory = {"json-converter": {"version": "2.0.0", "digest": DIGEST, "wasmSha256": WASM_HASH}}
+        expected_calls = {("registry.example/plugins/jsonrpc-converter", DIGEST), (retained["repository"], retained["digest"])}
+        for plugin in plugins[1:]:
+            self.assertEqual(plugin["version"], "2.0.1")
+            self.assertEqual([old["version"] for old in plugin["history"]], ["2.0.0"])
+            records = []
+            for artifact in [plugin] + plugin["history"]:
+                repository = artifact["ociRef"].rsplit(":", 1)[0]
+                expected_calls.add((repository, artifact["digest"]))
+                payload = self.payloads[(repository, artifact["digest"])]
+                for path in (plugin["logicalId"], plugin["logicalId"] + "-compat"):
+                    target = self.output / path / artifact["version"] / "plugin.wasm"
+                    self.assertEqual(target.read_bytes(), payload)
+                    self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), artifact["wasmSha256"])
+                records.append({field: artifact[field] for field in ("version", "digest", "wasmSha256")})
+            record = dict(records[0], history=records[1:])
+            expected_inventory[plugin["logicalId"]] = record
+            expected_inventory[plugin["logicalId"] + "-compat"] = record
+        self.assertEqual(len(self.calls), 20)
+        self.assertEqual({call[:2] for call in self.calls}, expected_calls)
+        self.assertEqual((self.output / "retained-unmanaged" / "2.0.0" / "plugin.wasm").read_bytes(), WASM)
+        self.assertEqual(json.loads((self.output / "snapshot-inventory.json").read_text()), expected_inventory)
+        print("T03 test_migrated_ownership_materializes_nine_managed_current_and_history_entries: 9 managed plugins, 18 canonical + 18 alias paths, strict lock equality and inventory verified")
+
     def test_invalid_history_fails_before_any_download(self):
         for case in ("duplicate", "latest", "traversal", "tag-drift", "bad-hash", "unknown-field", "tag-129", "tag-256", "tag-leading-dash", "tag-non-ascii"):
             with self.subTest(case=case):
@@ -630,13 +693,16 @@ class UnmanagedHistoryTest(unittest.TestCase):
             "oauth": ("05166e398b1c94d95b43eea8e4936e108b38deb2fc9871a3a856c3c23b18b36c", "99671c07ee2978dab95c17280321e608b4832eb251b1b63a95b39bf187b4f1ec"),
             "request-block": ("9ac8e3766a40a5415d0a41f282e8d040295804883917439d47235f5efe7c0db7", "d6f92128712592f456d3381169b128fa00ae971c7f34b1531dbf1f619c3d12bd"),
         }
-        checked_in = json.loads((pathlib.Path(__file__).with_name("unmanaged-plugins.lock.json")).read_text())["plugins"]
+        fixture = pathlib.Path(__file__).with_name("testdata") / "unmanaged-cpp-2.0.0.lock.json"
+        checked_in = json.loads(fixture.read_text())["plugins"]
+        self.assertEqual(set(checked_in), set(expected))
         for name, hashes in expected.items():
             item = checked_in[name]
             candidates = [item] + item.get("history", [])
             old = [candidate for candidate in candidates if candidate["servedVersion"] == "2.0.0"]
             self.assertEqual(len(old), 1)
             self.assertEqual((old[0]["digest"], old[0]["wasmSha256"]), ("sha256:" + hashes[0], hashes[1]))
+        print("T03 test_checked_in_cpp_200_identities_remain_available_for_history: 9 frozen 2.0.0 digest/hash pairs verified")
 
 
 if __name__ == "__main__":
