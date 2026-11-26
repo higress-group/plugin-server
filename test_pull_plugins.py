@@ -97,6 +97,8 @@ class MaterializeSnapshotTest(unittest.TestCase):
         self.assertIn("json-converter", inventory)
         self.assertIn("jsonrpc-converter", inventory)
         self.assertNotIn("basic-auth", inventory)
+        expected = {"version": "2.0.0", "digest": DIGEST, "wasmSha256": WASM_HASH}
+        self.assertEqual(inventory, {"json-converter": expected, "jsonrpc-converter": expected})
 
     def test_missing_extra_and_drifting_lock_fail_before_download(self):
         for plugins, expected in [({}, "missing"), ({"basic-auth": lock_item(), "extra": lock_item("extra")}, "extra")]:
@@ -112,10 +114,11 @@ class MaterializeSnapshotTest(unittest.TestCase):
         def mismatch(repository, digest, target):
             pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
             pathlib.Path(target).write_bytes(WASM)
-            return "b" * 64
+            return "b" * 64 if repository.endswith("/basic-auth") else WASM_HASH
         pull_plugins.copy_oci_wasm = mismatch
         with self.assertRaisesRegex(ValueError, "Wasm hash"):
             self.materialize()
+        self.assertFalse((self.output / "snapshot-inventory.json").exists())
 
 
 HOTFIX_IDS = ("basic-auth", "bot-detect", "custom-response", "hmac-auth", "jwt-auth", "key-auth", "key-rate-limit", "oauth", "request-block")
@@ -130,6 +133,351 @@ def synthetic_artifact(name, version):
         "digest": "sha256:" + hashlib.sha256(b"manifest:" + payload).hexdigest(),
         "wasmSha256": hashlib.sha256(payload).hexdigest(),
     }, payload
+
+
+def managed_artifact(version):
+    artifact, payload = synthetic_artifact("jsonrpc-converter", version)
+    return {
+        "version": version,
+        "ociRef": artifact["repository"] + ":" + version,
+        "digest": artifact["digest"],
+        "wasmSha256": artifact["wasmSha256"],
+        "provenanceMode": "public",
+    }, payload
+
+
+class ManagedHistoryTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temp.name)
+        self.snapshot = self.root / "snapshot.json"
+        self.properties = self.root / "plugins.properties"
+        self.lock_path = self.root / "unmanaged.json"
+        self.output = self.root / "plugins"
+        self.managed_entry = entry(aliases=["jsonrpc-converter"])
+        self.managed_entry["consumers"]["pluginServer"]["httpPath"] = "converter-http"
+        self.payloads = {("registry.example/plugins/basic-auth", DIGEST): WASM}
+        artifacts = []
+        for version in ("2.0.0", "3.0.0", "1.0.0"):
+            artifact, payload = managed_artifact(version)
+            artifacts.append(artifact)
+            self.payloads[(artifact["ociRef"].rsplit(":", 1)[0], artifact["digest"])] = payload
+        self.managed_entry.update({key: value for key, value in artifacts[0].items() if key != "provenanceMode"})
+        self.managed_entry["history"] = artifacts[1:]
+        self.properties.write_text("json-converter=oci://registry.example/plugins/jsonrpc-converter:2.0.0\nbasic-auth=oci://registry.example/plugins/basic-auth:2.0.0\n")
+        self.lock = {"basic-auth": lock_item()}
+        self.write_lock()
+        self.write_snapshot()
+        self.calls = []
+        self.original_copy = pull_plugins.copy_oci_wasm
+
+        def fake_copy(repository, digest, target):
+            self.calls.append((repository, digest, pathlib.Path(target)))
+            payload = self.payloads[(repository, digest)]
+            pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(target).write_bytes(payload)
+            return hashlib.sha256(payload).hexdigest()
+        self.fake_copy = fake_copy
+        pull_plugins.copy_oci_wasm = fake_copy
+
+    def tearDown(self):
+        pull_plugins.copy_oci_wasm = self.original_copy
+        self.temp.cleanup()
+
+    def write_snapshot(self, plugins=None):
+        self.snapshot.write_text(json.dumps({"schemaVersion": 1, "plugins": plugins if plugins is not None else [self.managed_entry]}))
+
+    def write_lock(self):
+        self.lock_path.write_text(json.dumps({"schemaVersion": 1, "plugins": self.lock}))
+
+    def materialize(self):
+        pull_plugins.materialize_snapshot(str(self.snapshot), str(self.output), str(self.properties), str(self.lock_path))
+
+    def assert_rejected_before_download(self, plugins=None):
+        self.write_snapshot(plugins)
+        with self.assertRaises(ValueError):
+            self.materialize()
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.output / "snapshot-inventory.json").exists())
+
+    def test_materializes_current_and_two_history_versions_in_snapshot_order(self):
+        self.materialize()
+        expected_records = []
+        for artifact in [self.managed_entry] + self.managed_entry["history"]:
+            payload = self.payloads[(artifact["ociRef"].rsplit(":", 1)[0], artifact["digest"])]
+            for path in ("converter-http", "json-converter", "jsonrpc-converter"):
+                target = self.output / path / artifact["version"] / "plugin.wasm"
+                self.assertEqual(target.read_bytes(), payload)
+                self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), artifact["wasmSha256"])
+            expected_records.append({field: artifact[field] for field in ("version", "digest", "wasmSha256")})
+        expected = dict(expected_records[0], history=expected_records[1:])
+        inventory = json.loads((self.output / "snapshot-inventory.json").read_text())
+        self.assertEqual(inventory, {path: expected for path in ("converter-http", "json-converter", "jsonrpc-converter")})
+        self.assertEqual([record["version"] for record in expected["history"]], ["3.0.0", "1.0.0"])
+        self.assertEqual([call[:2] for call in self.calls], [
+            (artifact["ociRef"].rsplit(":", 1)[0], artifact["digest"])
+            for artifact in [self.managed_entry] + self.managed_entry["history"]
+        ] + [("registry.example/plugins/basic-auth", DIGEST)])
+
+    def test_absent_and_empty_history_keep_current_only_inventory(self):
+        for case in ("absent", "empty"):
+            with self.subTest(case=case):
+                self.output = self.root / case
+                self.managed_entry.pop("history", None)
+                if case == "empty":
+                    self.managed_entry["history"] = []
+                self.write_snapshot()
+                self.materialize()
+                inventory = json.loads((self.output / "snapshot-inventory.json").read_text())
+                expected = {field: self.managed_entry[field] for field in ("version", "digest", "wasmSha256")}
+                self.assertEqual(inventory, {path: expected for path in ("converter-http", "json-converter", "jsonrpc-converter")})
+
+    def test_current_wasm_hash_is_optional(self):
+        del self.managed_entry["wasmSha256"]
+        self.write_snapshot()
+        self.materialize()
+        inventory = json.loads((self.output / "snapshot-inventory.json").read_text())
+        payload = self.payloads[("registry.example/plugins/jsonrpc-converter", self.managed_entry["digest"])]
+        self.assertEqual(inventory["json-converter"]["wasmSha256"], hashlib.sha256(payload).hexdigest())
+
+    def test_current_wasm_hash_mismatch_does_not_write_inventory(self):
+        self.managed_entry["wasmSha256"] = "b" * 64
+        self.write_snapshot()
+        with self.assertRaisesRegex(ValueError, "Wasm hash"):
+            self.materialize()
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse((self.output / "snapshot-inventory.json").exists())
+
+    def test_invalid_current_hashes_fail_before_download(self):
+        for value in (None, 123, [], {}, "", "a" * 63, "A" * 64, DIGEST):
+            with self.subTest(value=value):
+                self.managed_entry["wasmSha256"] = value
+                self.assert_rejected_before_download()
+
+    def test_invalid_history_lists_and_entries_fail_before_download(self):
+        for value in (None, {}, "history", 1, [None], [[]], ["artifact"], [1]):
+            with self.subTest(history=value):
+                self.managed_entry["history"] = value
+                self.assert_rejected_before_download()
+
+    def test_history_missing_required_fields_fail_before_download(self):
+        original = copy.deepcopy(self.managed_entry)
+        for field in ("version", "ociRef", "digest", "wasmSha256", "provenanceMode"):
+            with self.subTest(field=field):
+                self.managed_entry = copy.deepcopy(original)
+                del self.managed_entry["history"][-1][field]
+                self.assert_rejected_before_download()
+
+    def test_invalid_history_identities_fail_before_download(self):
+        original = copy.deepcopy(self.managed_entry)
+        cases = {
+            "unknown-field": {"servedPath": "override"},
+            "current-version": {"version": "2.0.0", "ociRef": original["ociRef"]},
+            "duplicate-version": {"version": "3.0.0", "ociRef": original["history"][0]["ociRef"]},
+            "current-oci-identity": {"digest": original["digest"]},
+            "duplicate-oci-identity": {"digest": original["history"][0]["digest"]},
+            "latest": {"version": "latest", "ociRef": "registry.example/plugins/jsonrpc-converter:latest"},
+            "traversal": {"version": "../escape", "ociRef": "registry.example/plugins/jsonrpc-converter:../escape"},
+            "backslash": {"version": "..\\escape"},
+            "nul": {"version": "bad\x00version"},
+            "dot": {"version": "."},
+            "version-type": {"version": []},
+            "tag-drift": {"ociRef": "registry.example/plugins/jsonrpc-converter:0.0.1"},
+            "repository-drift": {"ociRef": "other.example/plugins/jsonrpc-converter:1.0.0"},
+            "image-drift": {"ociRef": "registry.example/plugins/other:1.0.0"},
+            "reference-type": {"ociRef": {}},
+            "digest-reference": {"ociRef": "registry.example/plugins/jsonrpc-converter@" + DIGEST},
+            "bare-digest": {"digest": "a" * 64},
+            "digest-length": {"digest": "sha256:" + "a" * 63},
+            "digest-uppercase": {"digest": "sha256:" + "A" * 64},
+            "digest-type": {"digest": None},
+            "oci-digest-as-wasm-hash": {"wasmSha256": DIGEST},
+            "hash-length": {"wasmSha256": "a" * 63},
+            "hash-uppercase": {"wasmSha256": "A" * 64},
+            "hash-type": {"wasmSha256": []},
+            "provenance-mode": {"provenanceMode": "bootstrap-public"},
+            "provenance-type": {"provenanceMode": None},
+        }
+        for case, changes in cases.items():
+            with self.subTest(case=case):
+                self.managed_entry = copy.deepcopy(original)
+                self.managed_entry["history"][-1].update(changes)
+                self.assert_rejected_before_download()
+                print("T03 invalid managed history %s: copy_calls=0" % case)
+
+    def candidate_history(self):
+        artifact = self.managed_entry["history"][-1]
+        artifact.update({
+            "provenanceMode": "candidate", "sourceCommit": "c" * 40, "inputHash": "sha256:" + "d" * 64,
+            "candidateRef": "registry.example/candidates/jsonrpc-converter:1.0.0@" + artifact["digest"],
+        })
+        return artifact
+
+    def test_candidate_history_accepts_optional_strict_import_reference(self):
+        artifact = self.candidate_history()
+        for imported in (False, True):
+            with self.subTest(imported=imported):
+                self.output = self.root / ("imported" if imported else "candidate")
+                if imported:
+                    artifact["candidateImport"] = {"path": "plugins/release/import.json", "sha256": "e" * 64}
+                self.write_snapshot()
+                self.materialize()
+                inventory = json.loads((self.output / "snapshot-inventory.json").read_text())
+                self.assertEqual(inventory["json-converter"]["history"][-1], {field: artifact[field] for field in ("version", "digest", "wasmSha256")})
+
+    def test_public_history_rejects_candidate_provenance(self):
+        original = copy.deepcopy(self.managed_entry)
+        for field, value in {"sourceCommit": "c" * 40, "inputHash": DIGEST, "candidateRef": "ref", "candidateImport": None}.items():
+            with self.subTest(field=field):
+                self.managed_entry = copy.deepcopy(original)
+                self.managed_entry["history"][-1][field] = value
+                self.assert_rejected_before_download()
+
+    def test_candidate_history_rejects_missing_or_invalid_provenance(self):
+        self.candidate_history()
+        original = copy.deepcopy(self.managed_entry)
+        for field in ("sourceCommit", "inputHash", "candidateRef"):
+            with self.subTest(missing=field):
+                self.managed_entry = copy.deepcopy(original)
+                del self.managed_entry["history"][-1][field]
+                self.assert_rejected_before_download()
+        for field, values in {
+            "sourceCommit": (None, "c" * 39, "C" * 40),
+            "inputHash": (None, "d" * 64, "sha256:" + "D" * 64),
+            "candidateRef": (None, "registry.example/candidates/plugin:1.0.0", "registry.example/candidates/plugin:1.0.0@" + DIGEST,
+                             "registry.example/candidates/plugin:latest@" + original["history"][-1]["digest"]),
+        }.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.managed_entry = copy.deepcopy(original)
+                    self.managed_entry["history"][-1][field] = value
+                    self.assert_rejected_before_download()
+
+    def test_candidate_history_rejects_invalid_import_reference(self):
+        self.candidate_history()
+        original = copy.deepcopy(self.managed_entry)
+        proofs = [None, [], {}, {"path": "proof.json"}, {"sha256": "e" * 64},
+                  {"path": "proof.json", "sha256": "e" * 64, "extra": True}]
+        proofs += [{"path": path, "sha256": "e" * 64} for path in (None, "", "/proof.json", "../proof.json", "proof/../file.json", "proof\\file.json", "proof\x00.json")]
+        proofs += [{"path": "proof.json", "sha256": value} for value in (None, DIGEST, "E" * 64)]
+        for proof in proofs:
+            with self.subTest(proof=proof):
+                self.managed_entry = copy.deepcopy(original)
+                self.managed_entry["history"][-1]["candidateImport"] = proof
+                self.assert_rejected_before_download()
+
+    def test_history_does_not_require_semver_or_temporal_order(self):
+        self.managed_entry["history"][0].update({"version": "release_older", "ociRef": "registry.example/plugins/jsonrpc-converter:release_older"})
+        self.write_snapshot()
+        self.materialize()
+        self.assertTrue((self.output / "converter-http" / "release_older" / "plugin.wasm").exists())
+
+    def test_managed_path_collisions_fail_before_download(self):
+        for field in ("httpPath", "inventoryKey", "aliases"):
+            for historical in (False, True):
+                with self.subTest(field=field, historical=historical):
+                    other = entry("other")
+                    other["version"] = "3.0.0"
+                    other["ociRef"] = "registry.example/plugins/jsonrpc-converter:3.0.0"
+                    if historical:
+                        other["version"] = "4.0.0"
+                        other["ociRef"] = "registry.example/plugins/jsonrpc-converter:4.0.0"
+                        other["history"] = [copy.deepcopy(self.managed_entry["history"][0])]
+                    other["consumers"]["pluginServer"][field] = ["converter-http"] if field == "aliases" else "converter-http"
+                    self.assert_rejected_before_download([self.managed_entry, other])
+
+    def test_managed_history_collides_with_unmanaged_current_and_history(self):
+        original = copy.deepcopy(self.managed_entry)
+        for historical in (False, True):
+            with self.subTest(unmanaged_history=historical):
+                self.managed_entry = copy.deepcopy(original)
+                self.managed_entry.update({"version": "4.0.0", "ociRef": "registry.example/plugins/jsonrpc-converter:4.0.0"})
+                self.managed_entry["consumers"]["pluginServer"]["httpPath"] = "basic-auth"
+                if historical:
+                    old, _ = synthetic_artifact("basic-auth", "1.0.0")
+                    self.lock["basic-auth"]["history"] = [old]
+                else:
+                    self.managed_entry["history"][0].update({"version": "2.0.0", "ociRef": original["ociRef"]})
+                self.write_lock()
+                self.write_snapshot()
+                with self.assertRaisesRegex(ValueError, "collide"):
+                    self.materialize()
+                self.assertEqual(self.calls, [])
+
+    def test_managed_key_remaining_in_lock_is_rejected(self):
+        self.lock["json-converter"] = lock_item("json-converter")
+        self.write_lock()
+        self.assert_rejected_before_download()
+
+    def test_unsafe_paths_and_current_image_drift_fail_before_download(self):
+        original = copy.deepcopy(self.managed_entry)
+        for field, value in (("httpPath", "../escape"), ("inventoryKey", "../escape"), ("aliases", ["../escape"])):
+            with self.subTest(field=field):
+                self.managed_entry = copy.deepcopy(original)
+                self.managed_entry["consumers"]["pluginServer"][field] = value
+                self.assert_rejected_before_download()
+        for image in ("plugins/other", "../plugins/jsonrpc-converter", 1):
+            with self.subTest(image=image):
+                self.managed_entry = copy.deepcopy(original)
+                self.managed_entry["image"] = image
+                self.assert_rejected_before_download()
+
+    def test_duplicate_mapping_names_for_one_artifact_are_folded(self):
+        self.managed_entry["consumers"]["pluginServer"].update({"httpPath": "json-converter", "aliases": ["json-converter", "jsonrpc-converter", "jsonrpc-converter"]})
+        self.write_snapshot()
+        self.materialize()
+        self.assertEqual(len(self.calls), 4)
+        inventory = json.loads((self.output / "snapshot-inventory.json").read_text())
+        self.assertEqual(set(inventory), {"json-converter", "jsonrpc-converter"})
+
+    def test_history_wasm_hash_mismatch_does_not_write_inventory(self):
+        self.managed_entry["history"][-1]["wasmSha256"] = "b" * 64
+        self.write_snapshot()
+        with self.assertRaisesRegex(ValueError, "Wasm hash"):
+            self.materialize()
+        self.assertEqual(len(self.calls), 3)
+        self.assertFalse((self.output / "snapshot-inventory.json").exists())
+
+    def test_missing_invalid_or_failed_history_bytes_do_not_write_inventory(self):
+        for case in ("missing", "non-wasm", "truncated", "returned-hash", "blob-error"):
+            with self.subTest(case=case):
+                self.output = self.root / case
+                self.calls.clear()
+
+                def broken_copy(repository, digest, target):
+                    if digest != self.managed_entry["history"][0]["digest"]:
+                        return self.fake_copy(repository, digest, target)
+                    self.calls.append((repository, digest, pathlib.Path(target)))
+                    if case == "blob-error":
+                        raise subprocess.CalledProcessError(1, ["oras", "cp"])
+                    if case != "missing":
+                        pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
+                        pathlib.Path(target).write_bytes(b"not-wasm" if case == "non-wasm" else b"\x00asm" if case == "truncated" else WASM)
+                    return "b" * 64
+                pull_plugins.copy_oci_wasm = broken_copy
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    self.materialize()
+                self.assertEqual(len(self.calls), 2)
+                self.assertFalse((self.output / "snapshot-inventory.json").exists())
+
+    def test_shared_managed_oci_identity_is_downloaded_once(self):
+        other = entry("other")
+        other.update({field: self.managed_entry[field] for field in ("version", "ociRef", "digest", "wasmSha256")})
+        self.write_snapshot([self.managed_entry, other])
+        self.materialize()
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual((self.output / "other" / "2.0.0" / "plugin.wasm").read_bytes(),
+                         (self.output / "converter-http" / "2.0.0" / "plugin.wasm").read_bytes())
+
+    def test_cached_artifact_still_checks_each_expected_wasm_hash(self):
+        other = entry("other")
+        other.update({field: self.managed_entry[field] for field in ("version", "ociRef", "digest")})
+        other["wasmSha256"] = "b" * 64
+        self.write_snapshot([self.managed_entry, other])
+        with self.assertRaisesRegex(ValueError, "Wasm hash"):
+            self.materialize()
+        self.assertEqual(len(self.calls), 3)
+        self.assertFalse((self.output / "snapshot-inventory.json").exists())
 
 
 class UnmanagedHistoryTest(unittest.TestCase):

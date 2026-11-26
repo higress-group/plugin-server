@@ -1,0 +1,23 @@
+name: Plugin Server Python Tests
+
+on:
+  pull_request:
+    paths:
+      - '**.py'
+      - '.github/workflows/test-plugin-server.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Python unit tests
+        run: python3 -m unittest test_pull_plugins.py
