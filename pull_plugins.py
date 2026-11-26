@@ -64,6 +64,8 @@ def read_unmanaged_lock(path):
 
 
 def parse_tag_reference(reference):
+    if not isinstance(reference, str):
+        raise ValueError("properties reference must be a repository:tag")
     repository, separator, tag = reference.rpartition(":")
     if not separator or "/" not in repository or not valid_oci_tag(tag) or "@" in reference:
         raise ValueError("properties reference must be a repository:tag")
@@ -129,11 +131,68 @@ def reserve_unmanaged_path(reserved_paths, served_path, version, name):
 
 
 def valid_digest(value):
-    return value.startswith(DIGEST_PREFIX) and len(value) == 71 and all(char in "0123456789abcdef" for char in value[len(DIGEST_PREFIX):])
+    return isinstance(value, str) and value.startswith(DIGEST_PREFIX) and len(value) == 71 and all(char in "0123456789abcdef" for char in value[len(DIGEST_PREFIX):])
 
 
 def valid_hash(value):
-    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def valid_proof_reference(value):
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"} or not valid_hash(value["sha256"]):
+        return False
+    path = value["path"]
+    return isinstance(path, str) and all(safe_path_component(component) for component in path.split("/"))
+
+
+def validate_snapshot_history(entry, repository):
+    if "wasmSha256" in entry and not valid_hash(entry["wasmSha256"]):
+        raise ValueError("snapshot current has an invalid Wasm hash")
+    history = entry.get("history", [])
+    if not isinstance(history, list):
+        raise ValueError("snapshot history must be a list")
+    versions = {entry["version"]}
+    identities = {(repository, entry["digest"])}
+    required = {"version", "ociRef", "digest", "wasmSha256", "provenanceMode"}
+    provenance = {"sourceCommit", "inputHash", "candidateRef", "candidateImport"}
+    for artifact in history:
+        if not isinstance(artifact, dict) or not required <= set(artifact) or set(artifact) - required - provenance:
+            raise ValueError("snapshot history has an invalid schema")
+        version = artifact["version"]
+        if not safe_path_component(version) or version == "latest" or version in versions:
+            raise ValueError("snapshot history has an unsafe, mutable or duplicate version")
+        old_repository, tag = parse_tag_reference(artifact["ociRef"])
+        if old_repository != repository or tag != version:
+            raise ValueError("snapshot history OCI repository, tag and version disagree")
+        if not valid_digest(artifact["digest"]) or not valid_hash(artifact["wasmSha256"]):
+            raise ValueError("snapshot history has invalid immutable hashes")
+        identity = (old_repository, artifact["digest"])
+        if identity in identities:
+            raise ValueError("snapshot history has a duplicate OCI identity")
+        versions.add(version)
+        identities.add(identity)
+        mode = artifact["provenanceMode"]
+        if mode == "public":
+            if set(artifact) & provenance:
+                raise ValueError("snapshot public history must omit candidate provenance")
+        elif mode == "candidate":
+            source = artifact.get("sourceCommit")
+            if not isinstance(source, str) or re.fullmatch(r"[0-9a-f]{40}", source) is None or not valid_digest(artifact.get("inputHash")):
+                raise ValueError("snapshot candidate history has invalid source provenance")
+            reference = artifact.get("candidateRef")
+            if not isinstance(reference, str) or reference.rpartition("@")[2] != artifact["digest"]:
+                raise ValueError("snapshot candidate history reference must pin the same digest")
+            _, candidate_tag = parse_tag_reference(reference.rpartition("@")[0])
+            if candidate_tag == "latest":
+                raise ValueError("snapshot candidate history has a mutable tag")
+            if "candidateImport" in artifact and not valid_proof_reference(artifact["candidateImport"]):
+                raise ValueError("snapshot candidate history has an invalid import proof reference")
+        else:
+            raise ValueError("snapshot history has an invalid provenance mode")
+
+
+def snapshot_paths(mapping):
+    return list(dict.fromkeys([mapping["httpPath"], mapping["inventoryKey"]] + mapping.get("aliases", [])))
 
 
 def safe_extract_wasm(archive, destination):
@@ -198,26 +257,36 @@ def snapshot_entries(snapshot):
         mapping = entry.get("consumers", {}).get("pluginServer")
         if not mapping:
             continue
+        if not isinstance(mapping, dict):
+            raise ValueError("snapshot plugin-server mapping must be an object")
         required = ("logicalId", "image", "version", "ociRef", "digest")
         if any(not entry.get(key) for key in required):
             raise ValueError("snapshot plugin lacks immutable identity")
         key = mapping.get("inventoryKey")
         path = mapping.get("httpPath")
         aliases = mapping.get("aliases", [])
-        if not isinstance(aliases, list) or not key or not path or key in seen:
+        if not isinstance(aliases, list) or not key or not path:
             raise ValueError("snapshot plugin-server mapping is missing or ambiguous")
         names = [key] + aliases
-        if any(not safe_path_component(name) or name in seen for name in names) or not safe_path_component(path) or not safe_path_component(entry["version"]):
+        if any(not safe_path_component(name) for name in names) or not safe_path_component(path) or not safe_path_component(entry["version"]):
             raise ValueError("snapshot plugin-server mapping has an unsafe or duplicate path")
-        seen.update(names)
+        served_paths = snapshot_paths(mapping)
+        if seen & set(served_paths):
+            raise ValueError("snapshot plugin-server mapping is missing or ambiguous")
+        seen.update(served_paths)
         repository, tag = parse_tag_reference(entry["ociRef"])
         if not repository or tag != entry["version"] or tag == "latest" or not valid_digest(entry["digest"]):
             raise ValueError("snapshot OCI tag and version disagree")
-        for served_path in set(names + [path]):
-            claim = (served_path, entry["version"])
-            if claim in paths:
-                raise ValueError("snapshot plugin-server paths are ambiguous")
-            paths.add(claim)
+        image = entry["image"]
+        if not isinstance(image, str) or not all(safe_path_component(component) for component in image.split("/")) or not repository.endswith("/" + image):
+            raise ValueError("snapshot OCI repository and image disagree")
+        validate_snapshot_history(entry, repository)
+        for artifact in [entry] + entry.get("history", []):
+            for served_path in served_paths:
+                claim = (served_path, artifact["version"])
+                if claim in paths:
+                    raise ValueError("snapshot plugin-server paths are ambiguous")
+                paths.add(claim)
         yield entry, mapping
 
 
@@ -234,8 +303,8 @@ def materialize_snapshot(snapshot_path, output, properties_path, lock_path):
     for entry, mapping in entries:
         aliases = [mapping["inventoryKey"]] + mapping.get("aliases", [])
         managed.update(aliases)
-        managed_paths.add((mapping["httpPath"], entry["version"]))
-        managed_paths.update((alias, entry["version"]) for alias in aliases)
+        for artifact in [entry] + entry.get("history", []):
+            managed_paths.update((path, artifact["version"]) for path in snapshot_paths(mapping))
     validate_unmanaged_lock(properties, managed, lock)
     for name in sorted(lock):
         item = lock[name]
@@ -245,18 +314,37 @@ def materialize_snapshot(snapshot_path, output, properties_path, lock_path):
             raise ValueError("managed and unmanaged plugin paths collide")
 
     written = {}
+    downloads = {}
     for entry, mapping in entries:
-        target = os.path.join(output, mapping["httpPath"], entry["version"], "plugin.wasm")
-        content_hash = copy_oci_wasm(entry["ociRef"].rsplit(":", 1)[0], entry["digest"], target)
-        for alias in [mapping["inventoryKey"]] + mapping.get("aliases", []):
-            alias_target = os.path.join(output, alias, entry["version"], "plugin.wasm")
-            if os.path.abspath(alias_target) != os.path.abspath(target):
-                os.makedirs(os.path.dirname(alias_target), exist_ok=True)
-                shutil.copyfile(target, alias_target)
-            written[alias] = {"version": entry["version"], "digest": entry["digest"], "wasmSha256": content_hash}
-    with open(os.path.join(output, "snapshot-inventory.json"), "w", encoding="utf-8") as target:
-        json.dump(dict(sorted(written.items())), target, indent=2, sort_keys=True)
-        target.write("\n")
+        records = []
+        for artifact in [entry] + entry.get("history", []):
+            target = os.path.join(output, mapping["httpPath"], artifact["version"], "plugin.wasm")
+            repository = artifact["ociRef"].rsplit(":", 1)[0]
+            identity = (repository, artifact["digest"])
+            if identity in downloads:
+                cached_target, content_hash = downloads[identity]
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copyfile(cached_target, target)
+            else:
+                content_hash = copy_oci_wasm(repository, artifact["digest"], target)
+                if not is_valid_wasm(target):
+                    raise ValueError("managed plugin artifact is not a Wasm module")
+                if content_hash != sha256_file(target):
+                    raise ValueError("managed plugin Wasm hash does not match downloaded bytes")
+            if "wasmSha256" in artifact and content_hash != artifact["wasmSha256"]:
+                raise ValueError("managed plugin Wasm hash does not match snapshot")
+            downloads[identity] = (target, content_hash)
+            for path in snapshot_paths(mapping):
+                alias_target = os.path.join(output, path, artifact["version"], "plugin.wasm")
+                if os.path.abspath(alias_target) != os.path.abspath(target):
+                    os.makedirs(os.path.dirname(alias_target), exist_ok=True)
+                    shutil.copyfile(target, alias_target)
+            records.append({"version": artifact["version"], "digest": artifact["digest"], "wasmSha256": content_hash})
+        inventory = records[0]
+        if len(records) > 1:
+            inventory["history"] = records[1:]
+        for path in snapshot_paths(mapping):
+            written[path] = inventory
     # Preserve source-owned unmanaged C++/compatibility entries. Properties
     # retain their public served identity; only the sibling lock supplies the
     # immutable pull reference. Snapshot-managed keys are never duplicated.
@@ -268,6 +356,9 @@ def materialize_snapshot(snapshot_path, output, properties_path, lock_path):
             content_hash = copy_oci_wasm(artifact["repository"], artifact["digest"], target)
             if content_hash != artifact["wasmSha256"]:
                 raise ValueError("unmanaged plugin %s Wasm hash does not match source-owned lock" % label)
+    with open(os.path.join(output, "snapshot-inventory.json"), "w", encoding="utf-8") as target:
+        json.dump(dict(sorted(written.items())), target, indent=2, sort_keys=True)
+        target.write("\n")
 
 
 def materialize_legacy(properties_path, output):

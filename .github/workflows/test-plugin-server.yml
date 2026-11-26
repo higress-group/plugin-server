@@ -1,0 +1,24 @@
+name: Plugin Server Python Tests
+
+on:
+  pull_request:
+    paths:
+      - '**.py'
+      - '.github/workflows/test-plugin-server.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Fetch existing regression fixture baseline
+        run: git fetch --no-tags --depth=1 origin 8a550170345752d92b715f239f642083d8e9a772
+      - name: Python unit tests
+        run: python3 -m unittest test_pull_plugins.py
