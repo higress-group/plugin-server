@@ -17,7 +17,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
           persist-credentials: false
+      - name: Fetch existing regression fixture baseline
+        run: git fetch --no-tags --depth=1 origin 8a550170345752d92b715f239f642083d8e9a772
       - name: Python unit tests
         run: python3 -m unittest test_pull_plugins.py
